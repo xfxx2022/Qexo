@@ -1561,3 +1561,125 @@ class CFImgBedProviderTests(SimpleTestCase):
         self.assertNotIn("serverCompress", params)
         self.assertNotIn("autoRetry", params)
         self.assertNotIn("returnFormat", params)
+
+class CFImgBedDirectUploadTests(SimpleTestCase):
+    def test_direct_config_uses_auth_code_without_exposing_api_key(self):
+        provider = CFImgBedMain(
+            api="https://api.example.com/upload",
+            api_key="imgbed_secret",
+            auth_code="upload-only",
+            upload_channel="cfr2",
+        )
+
+        config = provider.direct_upload_config()
+
+        self.assertEqual(config["url"], "https://api.example.com/upload")
+        self.assertEqual(config["headers"], {})
+        self.assertEqual(config["params"]["authCode"], "upload-only")
+        self.assertEqual(config["params"]["uploadChannel"], "cfr2")
+        self.assertNotIn("imgbed_secret", json.dumps(config))
+
+    def test_direct_config_uses_api_key_when_auth_code_is_missing(self):
+        provider = CFImgBedMain(
+            api="https://api.example.com/upload",
+            api_key="imgbed_secret",
+        )
+
+        config = provider.direct_upload_config()
+
+        self.assertEqual(config["headers"], {"Authorization": "Bearer imgbed_secret"})
+        self.assertNotIn("authCode", config["params"])
+
+    def test_complete_direct_upload_rejects_unexpected_host(self):
+        provider = CFImgBedMain(
+            api="https://api.example.com/upload",
+            auth_code="upload-only",
+            custom_url="https://img.example.com",
+        )
+
+        with self.assertRaisesRegex(ValueError, "unexpected host"):
+            provider.complete_direct_upload("https://attacker.example/file/test.png")
+
+
+class CFImgBedDirectUploadApiTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.user = User.objects.create_user(username="image_user", password="image_pass")
+        self.client.force_login(self.user)
+        self.image_host = {
+            "type": "CFImgBed",
+            "params": {
+                "api": "https://api.example.com/upload",
+                "api_key": "imgbed_secret",
+                "auth_code": "upload-only",
+                "custom_url": "https://img.example.com",
+            },
+        }
+
+    @patch("hexoweb.api.get_setting_cached")
+    def test_config_endpoint_returns_direct_config_without_api_key(self, mock_setting):
+        mock_setting.return_value = json.dumps(self.image_host)
+
+        response = self.client.get("/api/upload/config/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["direct"])
+        self.assertEqual(payload["provider"], "CFImgBed")
+        self.assertEqual(payload["config"]["params"]["authCode"], "upload-only")
+        self.assertNotIn("imgbed_secret", response.content.decode("utf-8"))
+        self.assertEqual(response["Cache-Control"], "no-store")
+
+    @patch("hexoweb.api.get_setting_cached")
+    def test_config_endpoint_supports_api_key_only_bearer_upload(self, mock_setting):
+        api_key_host = json.loads(json.dumps(self.image_host))
+        api_key_host["params"]["auth_code"] = ""
+        mock_setting.return_value = json.dumps(api_key_host)
+
+        response = self.client.get("/api/upload/config/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["direct"])
+        self.assertEqual(
+            payload["config"]["headers"],
+            {"Authorization": "Bearer imgbed_secret"},
+        )
+        self.assertNotIn("authCode", payload["config"]["params"])
+
+    @patch("hexoweb.api.get_setting_cached")
+    def test_complete_endpoint_records_direct_upload_and_server_delete_credentials(self, mock_setting):
+        mock_setting.return_value = json.dumps(self.image_host)
+
+        response = self.client.post("/api/upload/complete/", {
+            "remote_url": "/file/test.png",
+            "name": "test.png",
+            "size": "6291456",
+            "content_type": "image/png",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["status"])
+        self.assertEqual(payload["url"], "https://img.example.com/file/test.png")
+        image = ImageModel.objects.get(name="test.png")
+        self.assertEqual(image.size, "6291456")
+        delete_config = json.loads(image.deleteConfig)
+        self.assertEqual(delete_config["provider"], "CFImgBed")
+        self.assertEqual(delete_config["api_key"], "imgbed_secret")
+        self.assertEqual(delete_config["auth_code"], "upload-only")
+
+    @patch("hexoweb.api.get_setting_cached")
+    def test_complete_endpoint_rejects_unexpected_remote_host(self, mock_setting):
+        mock_setting.return_value = json.dumps(self.image_host)
+
+        response = self.client.post("/api/upload/complete/", {
+            "remote_url": "https://attacker.example/file/test.png",
+            "name": "test.png",
+            "size": "1",
+            "content_type": "image/png",
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.json()["status"])
+        self.assertEqual(ImageModel.objects.count(), 0)
